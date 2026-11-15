@@ -1,11 +1,14 @@
+from io import BytesIO
 import os
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import xlwt
 
 
 st.set_page_config(
@@ -55,6 +58,7 @@ def initialize_database():
                 product_id INTEGER,
                 product_name TEXT NOT NULL,
                 sku TEXT NOT NULL,
+                unit TEXT NOT NULL DEFAULT '',
                 transaction_type TEXT NOT NULL CHECK (transaction_type IN ('Masuk', 'Keluar')),
                 quantity INTEGER NOT NULL CHECK (quantity > 0),
                 note TEXT NOT NULL DEFAULT '',
@@ -63,22 +67,42 @@ def initialize_database():
             );
             """
         )
+        transaction_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(stock_transactions)")
+        }
+        if "unit" not in transaction_columns:
+            connection.execute(
+                "ALTER TABLE stock_transactions ADD COLUMN unit TEXT NOT NULL DEFAULT ''"
+            )
         count = connection.execute("SELECT COUNT(*) FROM products").fetchone()[0]
         if count == 0:
             connection.executemany(
                 """
                 INSERT INTO products
-                    (sku, name, category, unit, stock_qty, min_stock, buy_price, sell_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (sku, name, category, unit, stock_qty, min_stock)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    ("BN-001", "Biji Kopi Arabika", "Bahan Baku", "kg", 12, 5, 145000, 0),
-                    ("BN-002", "Susu Fresh Milk", "Bahan Baku", "liter", 8, 4, 22000, 0),
-                    ("BN-003", "Sirup Gula Aren", "Bahan Baku", "botol", 3, 5, 38000, 0),
-                    ("PK-001", "Cup 12 oz", "Kemasan", "pcs", 120, 40, 900, 0),
-                    ("PK-002", "Tutup Cup 12 oz", "Kemasan", "pcs", 85, 40, 350, 0),
-                    ("PR-001", "Croissant Butter", "Produk Siap Jual", "pcs", 18, 8, 12000, 22000),
+                    ("BN-001", "Biji Kopi Arabika", "Bahan Baku", "kg", 12, 5),
+                    ("BN-002", "Susu Fresh Milk", "Bahan Baku", "liter", 8, 4),
+                    ("BN-003", "Sirup Gula Aren", "Bahan Baku", "botol", 3, 5),
+                    ("PK-001", "Cup 12 oz", "Kemasan", "pcs", 120, 40),
+                    ("PK-002", "Tutup Cup 12 oz", "Kemasan", "pcs", 85, 40),
+                    ("PR-001", "Croissant Butter", "Produk Siap Jual", "pcs", 18, 8),
                 ],
+            )
+        transaction_count = connection.execute(
+            "SELECT COUNT(*) FROM stock_transactions"
+        ).fetchone()[0]
+        if transaction_count == 0:
+            connection.execute(
+                """
+                INSERT INTO stock_transactions
+                    (product_id, product_name, sku, unit, transaction_type, quantity, note)
+                SELECT id, name, sku, unit, 'Masuk', stock_qty, 'Stok awal'
+                FROM products
+                WHERE stock_qty > 0
+                """
             )
 
 
@@ -92,9 +116,12 @@ def read_products():
 
 def read_transactions(limit=None):
     query = """
-        SELECT id, product_name, sku, transaction_type, quantity, note, created_at
-        FROM stock_transactions
-        ORDER BY datetime(created_at) DESC, id DESC
+        SELECT t.id, t.product_name, t.transaction_type, t.quantity,
+               COALESCE(NULLIF(t.unit, ''), p.unit, '') AS unit,
+               t.note, t.created_at
+        FROM stock_transactions AS t
+        LEFT JOIN products AS p ON p.id = t.product_id
+        ORDER BY datetime(t.created_at) DESC, t.id DESC
     """
     if limit is not None:
         query += " LIMIT ?"
@@ -103,24 +130,23 @@ def read_transactions(limit=None):
     return [dict(row) for row in rows]
 
 
-def save_product(product_id, sku, name, category, unit, stock_qty, min_stock, buy_price, sell_price):
-    values = (sku.strip(), name.strip(), category.strip(), unit.strip(), stock_qty, min_stock, buy_price, sell_price)
+def save_product(product_id, name, category, unit, stock_qty, min_stock):
+    values = (name.strip(), category.strip(), unit.strip(), stock_qty, min_stock)
     with database() as connection:
         if product_id is None:
             connection.execute(
                 """
                 INSERT INTO products
-                    (sku, name, category, unit, stock_qty, min_stock, buy_price, sell_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (sku, name, category, unit, stock_qty, min_stock)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                values,
+                (f"AUTO-{uuid.uuid4().hex[:12].upper()}",) + values,
             )
         else:
             connection.execute(
                 """
                 UPDATE products
-                SET sku = ?, name = ?, category = ?, unit = ?, stock_qty = ?,
-                    min_stock = ?, buy_price = ?, sell_price = ?
+                SET name = ?, category = ?, unit = ?, stock_qty = ?, min_stock = ?
                 WHERE id = ?
                 """,
                 values + (product_id,),
@@ -130,7 +156,7 @@ def save_product(product_id, sku, name, category, unit, stock_qty, min_stock, bu
 def record_transaction(product_id, transaction_type, quantity, note):
     with database() as connection:
         product = connection.execute(
-            "SELECT id, sku, name, stock_qty FROM products WHERE id = ?",
+            "SELECT id, sku, name, unit, stock_qty FROM products WHERE id = ?",
             (product_id,),
         ).fetchone()
         if product is None:
@@ -146,15 +172,19 @@ def record_transaction(product_id, transaction_type, quantity, note):
         connection.execute(
             """
             INSERT INTO stock_transactions
-                (product_id, product_name, sku, transaction_type, quantity, note)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (product_id, product_name, sku, unit, transaction_type, quantity, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (product["id"], product["name"], product["sku"], transaction_type, quantity, note.strip()),
+            (
+                product["id"],
+                product["name"],
+                product["sku"],
+                product["unit"],
+                transaction_type,
+                quantity,
+                note.strip(),
+            ),
         )
-
-
-def format_rupiah(amount):
-    return f"Rp {amount:,.0f}".replace(",", ".")
 
 
 def render_product_table(products):
@@ -168,17 +198,36 @@ def render_product_table(products):
         )
         rows.append(
             {
-                "SKU": product["sku"],
                 "Nama produk": product["name"],
                 "Kategori": product["category"],
                 "Stok": f'{product["stock_qty"]} {product["unit"]}',
                 "Batas minimum": f'{product["min_stock"]} {product["unit"]}',
-                "Harga beli": format_rupiah(product["buy_price"]),
-                "Harga jual": format_rupiah(product["sell_price"]) if product["sell_price"] else "—",
                 "Status": status,
             }
         )
-    st.dataframe(rows, width="stretch", hide_index=True)
+    styled_rows = (
+        pd.DataFrame(rows)
+        .style.set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", "#1B5E20"),
+                        ("color", "#FFFFFF"),
+                        ("font-weight", "600"),
+                    ],
+                },
+                {
+                    "selector": "td",
+                    "props": [
+                        ("background-color", "#FFFFFF"),
+                        ("color", "#1B3320"),
+                    ],
+                },
+            ]
+        )
+    )
+    st.dataframe(styled_rows, width="stretch", hide_index=True)
 
 
 def render_dashboard(products, transactions):
@@ -187,12 +236,10 @@ def render_dashboard(products, transactions):
 
     low_stock = [p for p in products if p["stock_qty"] <= p["min_stock"]]
     total_units = sum(p["stock_qty"] for p in products)
-    inventory_value = sum(p["stock_qty"] * p["buy_price"] for p in products)
-    metric_cols = st.columns(4)
+    metric_cols = st.columns(3)
     metric_cols[0].metric("Total produk", len(products))
     metric_cols[1].metric("Unit tersedia", f"{total_units:,}".replace(",", "."))
     metric_cols[2].metric("Perlu restock", len(low_stock), delta_color="inverse")
-    metric_cols[3].metric("Nilai persediaan", format_rupiah(inventory_value))
 
     left, right = st.columns([1.25, 1])
     with left:
@@ -215,7 +262,7 @@ def render_dashboard(products, transactions):
             for kind in ("Masuk", "Keluar"):
                 if kind not in movement.columns:
                     movement[kind] = 0
-            st.bar_chart(movement[["Masuk", "Keluar"]], color=["#9a6548", "#d9a36a"])
+            st.bar_chart(movement[["Masuk", "Keluar"]], color=["#1B5E20", "#388E3C"])
         else:
             st.info("Grafik akan tampil setelah ada transaksi stok.")
 
@@ -239,7 +286,7 @@ def render_dashboard(products, transactions):
                     "Waktu": item["created_at"],
                     "Produk": item["product_name"],
                     "Jenis": item["transaction_type"],
-                    "Jumlah": item["quantity"],
+                    "Jumlah": f'{item["quantity"]} {item["unit"]}'.strip(),
                     "Catatan": item["note"] or "—",
                 }
             )
@@ -250,19 +297,19 @@ def render_dashboard(products, transactions):
 
 def render_inventory(products):
     st.title("📦 Produk")
-    st.caption("Kelola katalog, harga, dan batas minimum persediaan.")
+    st.caption("Kelola katalog, stok, dan batas minimum persediaan.")
     list_tab, add_tab, edit_tab = st.tabs(["Daftar produk", "Tambah produk", "Edit / hapus"])
 
     with list_tab:
         search_col, category_col, status_col = st.columns([2, 1, 1])
-        search = search_col.text_input("Cari produk", placeholder="Nama atau SKU...")
+        search = search_col.text_input("Cari produk", placeholder="Nama produk...")
         categories = ["Semua kategori"] + sorted({p["category"] for p in products})
         category = category_col.selectbox("Kategori", categories)
         status = status_col.selectbox("Status stok", ["Semua", "Aman", "Stok menipis", "Habis"])
         filtered = products
         if search:
             query = search.casefold()
-            filtered = [p for p in filtered if query in p["name"].casefold() or query in p["sku"].casefold()]
+            filtered = [p for p in filtered if query in p["name"].casefold()]
         if category != "Semua kategori":
             filtered = [p for p in filtered if p["category"] == category]
         if status != "Semua":
@@ -278,62 +325,55 @@ def render_inventory(products):
         st.subheader("Tambah produk baru")
         with st.form("add_product_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
-            sku = col1.text_input("SKU", placeholder="Contoh: BN-004")
-            name = col2.text_input("Nama produk")
-            category = col1.text_input("Kategori", placeholder="Bahan Baku")
-            unit = col2.text_input("Satuan", placeholder="kg, liter, pcs...")
-            col3, col4, col5 = st.columns(3)
+            name = col1.text_input("Nama produk")
+            category = col2.text_input("Kategori", placeholder="Bahan Baku")
+            unit = col1.text_input("Satuan", placeholder="kg, liter, pcs...")
+            col3, col4 = st.columns(2)
             stock_qty = col3.number_input("Stok awal", min_value=0, step=1)
             min_stock = col4.number_input("Batas minimum", min_value=0, step=1)
-            buy_price = col5.number_input("Harga beli (Rp)", min_value=0, step=1000)
-            sell_price = st.number_input("Harga jual (Rp, opsional)", min_value=0, step=1000)
             submitted = st.form_submit_button("Simpan produk", type="primary")
         if submitted:
-            if not all((sku.strip(), name.strip(), category.strip(), unit.strip())):
-                st.error("SKU, nama, kategori, dan satuan wajib diisi.")
+            if not all((name.strip(), category.strip(), unit.strip())):
+                st.error("Nama, kategori, dan satuan wajib diisi.")
             else:
-                try:
-                    save_product(None, sku, name, category, unit, int(stock_qty), int(min_stock), int(buy_price), int(sell_price))
-                except sqlite3.IntegrityError:
-                    st.error("SKU sudah digunakan. Gunakan SKU yang berbeda.")
-                else:
-                    st.success("Produk berhasil ditambahkan.")
-                    st.rerun()
+                save_product(None, name, category, unit, int(stock_qty), int(min_stock))
+                st.success("Produk berhasil ditambahkan.")
+                st.rerun()
 
     with edit_tab:
         if not products:
             st.info("Belum ada produk untuk diedit.")
         else:
-            product_options = {f'{p["sku"]} · {p["name"]}': p for p in products}
-            selected_label = st.selectbox("Pilih produk", list(product_options))
-            selected = product_options[selected_label]
+            product_options = {p["id"]: p for p in products}
+            selected_id = st.selectbox(
+                "Pilih produk",
+                list(product_options),
+                format_func=lambda product_id: (
+                    f'{product_options[product_id]["name"]} · '
+                    f'{product_options[product_id]["category"]}'
+                ),
+            )
+            selected = product_options[selected_id]
             st.caption("Gunakan menu Transaksi untuk menyesuaikan jumlah stok agar riwayat tetap tercatat.")
             with st.form("edit_product_form"):
                 col1, col2 = st.columns(2)
-                sku = col1.text_input("SKU", value=selected["sku"])
-                name = col2.text_input("Nama produk", value=selected["name"])
-                category = col1.text_input("Kategori", value=selected["category"])
-                unit = col2.text_input("Satuan", value=selected["unit"])
-                col3, col4, col5 = st.columns(3)
+                name = col1.text_input("Nama produk", value=selected["name"])
+                category = col2.text_input("Kategori", value=selected["category"])
+                unit = col1.text_input("Satuan", value=selected["unit"])
+                col3, col4 = st.columns(2)
                 stock_qty = col3.number_input("Stok saat ini", min_value=0, value=selected["stock_qty"], step=1, disabled=True)
                 min_stock = col4.number_input("Batas minimum", min_value=0, value=selected["min_stock"], step=1)
-                buy_price = col5.number_input("Harga beli (Rp)", min_value=0, value=selected["buy_price"], step=1000)
-                sell_price = st.number_input("Harga jual (Rp)", min_value=0, value=selected["sell_price"], step=1000)
                 save = st.form_submit_button("Simpan perubahan", type="primary")
             if save:
-                if not all((sku.strip(), name.strip(), category.strip(), unit.strip())):
-                    st.error("SKU, nama, kategori, dan satuan wajib diisi.")
+                if not all((name.strip(), category.strip(), unit.strip())):
+                    st.error("Nama, kategori, dan satuan wajib diisi.")
                 else:
-                    try:
-                        save_product(
-                            selected["id"], sku, name, category, unit,
-                            selected["stock_qty"], int(min_stock), int(buy_price), int(sell_price),
-                        )
-                    except sqlite3.IntegrityError:
-                        st.error("SKU sudah digunakan oleh produk lain.")
-                    else:
-                        st.success("Perubahan produk berhasil disimpan.")
-                        st.rerun()
+                    save_product(
+                        selected["id"], name, category, unit,
+                        selected["stock_qty"], int(min_stock),
+                    )
+                    st.success("Perubahan produk berhasil disimpan.")
+                    st.rerun()
 
             with st.expander("Hapus produk"):
                 st.warning("Riwayat transaksi akan tetap tersimpan, tetapi tidak lagi terhubung ke produk.")
@@ -346,16 +386,24 @@ def render_inventory(products):
 
 
 def render_transactions(products):
-    st.title("↕️ Transaksi stok")
+    st.title("Produk masuk & keluar")
     st.caption("Catat stok masuk dari pemasok atau stok keluar untuk pemakaian dan penjualan.")
     if not products:
         st.info("Tambahkan produk terlebih dahulu di menu Produk.")
         return
 
-    product_options = {f'{p["sku"]} · {p["name"]} ({p["stock_qty"]} {p["unit"]})': p for p in products}
+    product_options = {p["id"]: p for p in products}
     with st.form("stock_transaction_form", clear_on_submit=True):
-        selected_label = st.selectbox("Produk", list(product_options))
-        product = product_options[selected_label]
+        selected_id = st.selectbox(
+            "Produk",
+            list(product_options),
+            format_func=lambda product_id: (
+                f'{product_options[product_id]["name"]} '
+                f'({product_options[product_id]["stock_qty"]} '
+                f'{product_options[product_id]["unit"]})'
+            ),
+        )
+        product = product_options[selected_id]
         col1, col2 = st.columns(2)
         transaction_type = col1.radio("Jenis transaksi", ["Masuk", "Keluar"], horizontal=True)
         quantity = col2.number_input("Jumlah", min_value=1, step=1)
@@ -375,41 +423,68 @@ def render_transactions(products):
     render_product_table(products)
 
 
+def export_history_xls(dataframe):
+    workbook = xlwt.Workbook(encoding="utf-8")
+    worksheet = workbook.add_sheet("Riwayat Stok")
+    for column_index, column in enumerate(dataframe.columns):
+        worksheet.write(0, column_index, str(column))
+
+    for row_index, row in enumerate(dataframe.itertuples(index=False, name=None), start=1):
+        for column_index, value in enumerate(row):
+            worksheet.write(row_index, column_index, "" if pd.isna(value) else str(value))
+
+    for column_index, column in enumerate(dataframe.columns):
+        values = dataframe[column].fillna("").astype(str)
+        width = max([len(str(column))] + [len(value) for value in values])
+        worksheet.col(column_index).width = min(max(width + 2, 12), 50) * 256
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def render_history(transactions):
     st.title("🧾 Riwayat transaksi")
-    st.caption("Semua perubahan stok yang tercatat.")
+    st.caption("Catatan stok produk yang masuk dan keluar.")
     if not transactions:
         st.info("Belum ada transaksi stok.")
         return
     data = pd.DataFrame(transactions)
     filter_col, search_col = st.columns([1, 2])
     transaction_type = filter_col.selectbox("Jenis", ["Semua", "Masuk", "Keluar"])
-    search = search_col.text_input("Cari produk / SKU", placeholder="Ketik nama produk atau SKU...")
+    search = search_col.text_input("Cari produk", placeholder="Ketik nama produk...")
     if transaction_type != "Semua":
         data = data[data["transaction_type"] == transaction_type]
     if search:
-        mask = (
-            data["product_name"].str.contains(search, case=False, na=False)
-            | data["sku"].str.contains(search, case=False, na=False)
-        )
-        data = data[mask]
+        data = data[data["product_name"].str.contains(search, case=False, na=False)]
 
+    metric_cols = st.columns(2)
+    metric_cols[0].metric(
+        "Transaksi masuk",
+        int((data["transaction_type"] == "Masuk").sum()),
+    )
+    metric_cols[1].metric(
+        "Transaksi keluar",
+        int((data["transaction_type"] == "Keluar").sum()),
+    )
+    data["Jumlah"] = data.apply(
+        lambda item: f'{item["quantity"]} {item["unit"]}'.strip(),
+        axis=1,
+    )
     shown = data.rename(
         columns={
             "created_at": "Waktu",
             "product_name": "Produk",
-            "sku": "SKU",
             "transaction_type": "Jenis",
-            "quantity": "Jumlah",
             "note": "Catatan",
         }
-    )[["Waktu", "Produk", "SKU", "Jenis", "Jumlah", "Catatan"]]
+    )[["Waktu", "Produk", "Jenis", "Jumlah", "Catatan"]]
     st.dataframe(shown, width="stretch", hide_index=True)
     st.download_button(
-        "Unduh CSV",
-        data=shown.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"riwayat-stok-{datetime.now():%Y%m%d}.csv",
-        mime="text/csv",
+        "Unduh Excel (.xls)",
+        data=export_history_xls(shown),
+        file_name=f"riwayat-stok-{datetime.now():%Y%m%d}.xls",
+        mime="application/vnd.ms-excel",
     )
 
 
@@ -419,21 +494,21 @@ def main():
     transactions = read_transactions()
 
     with st.sidebar:
-        st.markdown("# ☕ Kopi & Stok")
+        st.markdown("# ☕ I Need Coffee")
         st.caption("Manajemen inventaris kedai")
         page = st.radio(
             "Navigasi",
-            ["Ringkasan", "Produk", "Transaksi", "Riwayat"],
+            ["Ringkasan", "Produk", "Stok", "Riwayat"],
             label_visibility="collapsed",
         )
         st.divider()
-        st.caption("Data tersimpan di SQLite lokal.")
+        st.caption("")
 
     if page == "Ringkasan":
         render_dashboard(products, transactions)
     elif page == "Produk":
         render_inventory(products)
-    elif page == "Transaksi":
+    elif page == "Stok":
         render_transactions(products)
     else:
         render_history(transactions)
