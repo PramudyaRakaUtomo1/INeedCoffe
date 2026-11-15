@@ -53,6 +53,10 @@ def initialize_database():
                 sell_price INTEGER NOT NULL DEFAULT 0 CHECK (sell_price >= 0),
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
             CREATE TABLE IF NOT EXISTS stock_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER,
@@ -91,6 +95,14 @@ def initialize_database():
                     ("PR-001", "Croissant Butter", "Produk Siap Jual", "pcs", 18, 8),
                 ],
             )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO categories (name)
+            SELECT DISTINCT TRIM(category)
+            FROM products
+            WHERE TRIM(category) != ''
+            """
+        )
         transaction_count = connection.execute(
             "SELECT COUNT(*) FROM stock_transactions"
         ).fetchone()[0]
@@ -104,6 +116,20 @@ def initialize_database():
                 WHERE stock_qty > 0
                 """
             )
+
+
+def read_categories():
+    with database() as connection:
+        rows = connection.execute("SELECT name FROM categories ORDER BY name").fetchall()
+    return [row["name"] for row in rows]
+
+
+def save_category(name):
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("Nama kategori wajib diisi.")
+    with database() as connection:
+        connection.execute("INSERT INTO categories (name) VALUES (?)", (normalized_name,))
 
 
 def read_products():
@@ -298,14 +324,15 @@ def render_dashboard(products, transactions):
 def render_inventory(products):
     st.title("📦 Produk")
     st.caption("Kelola katalog, stok, dan batas minimum persediaan.")
-    list_tab, add_tab, edit_tab, delete_tab = st.tabs(
-        ["Daftar produk", "Tambah produk", "Edit produk", "Hapus produk"]
+    list_tab, add_tab, edit_tab, delete_tab, categories_tab = st.tabs(
+        ["Daftar produk", "Tambah produk", "Edit produk", "Hapus produk", "Kategori"]
     )
+    category_options = read_categories()
 
     with list_tab:
         search_col, category_col, status_col = st.columns([2, 1, 1])
         search = search_col.text_input("Cari produk", placeholder="Nama produk...")
-        categories = ["Semua kategori"] + sorted({p["category"] for p in products})
+        categories = ["Semua kategori"] + category_options
         category = category_col.selectbox("Kategori", categories)
         status = status_col.selectbox("Status stok", ["Semua", "Aman", "Stok menipis", "Habis"])
         filtered = products
@@ -328,7 +355,7 @@ def render_inventory(products):
         with st.form("add_product_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             name = col1.text_input("Nama produk")
-            category = col2.text_input("Kategori", placeholder="Bahan Baku")
+            category = col2.selectbox("Kategori", category_options)
             unit = col1.text_input("Satuan", placeholder="kg, liter, pcs...")
             col3, col4 = st.columns(2)
             stock_qty = col3.number_input("Stok awal", min_value=0, step=1)
@@ -360,7 +387,12 @@ def render_inventory(products):
             with st.form("edit_product_form"):
                 col1, col2 = st.columns(2)
                 name = col1.text_input("Nama produk", value=selected["name"])
-                category = col2.text_input("Kategori", value=selected["category"])
+                edit_category_options = sorted(set(category_options) | {selected["category"]})
+                category = col2.selectbox(
+                    "Kategori",
+                    edit_category_options,
+                    index=edit_category_options.index(selected["category"]),
+                )
                 unit = col1.text_input("Satuan", value=selected["unit"])
                 col3, col4 = st.columns(2)
                 stock_qty = col3.number_input("Stok saat ini", min_value=0, value=selected["stock_qty"], step=1, disabled=True)
@@ -431,6 +463,33 @@ def render_inventory(products):
                         )
                     st.success(f"{len(product_ids)} produk berhasil dihapus.")
                     st.rerun()
+
+    with categories_tab:
+        st.subheader("Tambah kategori produk")
+        with st.form("add_category_form", clear_on_submit=True):
+            new_category = st.text_input("Nama kategori", placeholder="Contoh: Minuman")
+            add_category = st.form_submit_button("Tambah kategori", type="primary")
+        if add_category:
+            if not new_category.strip():
+                st.error("Nama kategori wajib diisi.")
+            else:
+                try:
+                    save_category(new_category)
+                except sqlite3.IntegrityError:
+                    st.error("Kategori tersebut sudah tersedia.")
+                else:
+                    st.success(f'Kategori "{new_category.strip()}" berhasil ditambahkan.')
+                    st.rerun()
+
+        st.subheader("Kategori tersedia")
+        if category_options:
+            st.dataframe(
+                pd.DataFrame({"Kategori": category_options}),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("Belum ada kategori.")
 
 
 def render_transactions(products):
