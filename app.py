@@ -132,6 +132,51 @@ def save_category(name):
         connection.execute("INSERT INTO categories (name) VALUES (?)", (normalized_name,))
 
 
+def rename_category(old_name, new_name):
+    normalized_name = new_name.strip()
+    if not normalized_name:
+        raise ValueError("Nama kategori wajib diisi.")
+    if old_name == normalized_name:
+        return
+    with database() as connection:
+        result = connection.execute(
+            "UPDATE categories SET name = ? WHERE name = ?",
+            (normalized_name, old_name),
+        )
+        if result.rowcount == 0:
+            raise ValueError("Kategori tidak ditemukan.")
+        connection.execute(
+            "UPDATE products SET category = ? WHERE category = ?",
+            (normalized_name, old_name),
+        )
+
+
+def remove_category(name, replacement=None):
+    with database() as connection:
+        product_count = connection.execute(
+            "SELECT COUNT(*) FROM products WHERE category = ?",
+            (name,),
+        ).fetchone()[0]
+        if product_count and not replacement:
+            raise ValueError("Pindahkan produk ke kategori lain sebelum menghapus kategori ini.")
+        if replacement == name:
+            raise ValueError("Pilih kategori pengganti yang berbeda.")
+        if replacement:
+            exists = connection.execute(
+                "SELECT 1 FROM categories WHERE name = ?",
+                (replacement,),
+            ).fetchone()
+            if exists is None:
+                raise ValueError("Kategori pengganti tidak ditemukan.")
+            connection.execute(
+                "UPDATE products SET category = ? WHERE category = ?",
+                (replacement, name),
+            )
+        result = connection.execute("DELETE FROM categories WHERE name = ?", (name,))
+        if result.rowcount == 0:
+            raise ValueError("Kategori tidak ditemukan.")
+
+
 def read_products():
     with database() as connection:
         rows = connection.execute(
@@ -355,14 +400,22 @@ def render_inventory(products):
         with st.form("add_product_form", clear_on_submit=True):
             col1, col2 = st.columns(2)
             name = col1.text_input("Nama produk")
-            category = col2.selectbox("Kategori", category_options)
+            if category_options:
+                category = col2.selectbox("Kategori", category_options)
+            else:
+                category = None
+                col2.info("Tambahkan kategori terlebih dahulu.")
             unit = col1.text_input("Satuan", placeholder="kg, liter, pcs...")
             col3, col4 = st.columns(2)
             stock_qty = col3.number_input("Stok awal", min_value=0, step=1)
             min_stock = col4.number_input("Batas minimum", min_value=0, step=1)
-            submitted = st.form_submit_button("Simpan produk", type="primary")
+            submitted = st.form_submit_button(
+                "Simpan produk",
+                type="primary",
+                disabled=not category_options,
+            )
         if submitted:
-            if not all((name.strip(), category.strip(), unit.strip())):
+            if not name.strip() or not category or not category.strip() or not unit.strip():
                 st.error("Nama, kategori, dan satuan wajib diisi.")
             else:
                 save_product(None, name, category, unit, int(stock_qty), int(min_stock))
@@ -483,11 +536,99 @@ def render_inventory(products):
 
         st.subheader("Kategori tersedia")
         if category_options:
+            category_usage = {
+                category_name: sum(
+                    product["category"] == category_name for product in products
+                )
+                for category_name in category_options
+            }
             st.dataframe(
-                pd.DataFrame({"Kategori": category_options}),
+                pd.DataFrame(
+                    [
+                        {"Kategori": category_name, "Jumlah produk": category_usage[category_name]}
+                        for category_name in category_options
+                    ]
+                ),
                 width="stretch",
                 hide_index=True,
             )
+
+            st.divider()
+            st.subheader("Edit kategori")
+            category_to_edit = st.selectbox(
+                "Pilih kategori untuk diedit",
+                category_options,
+                key="edit_category_selection",
+            )
+            with st.form("edit_category_form"):
+                renamed_category = st.text_input(
+                    "Nama kategori baru",
+                    value=category_to_edit,
+                    key=f"renamed_category_{category_to_edit}",
+                )
+                rename_submitted = st.form_submit_button("Simpan nama kategori")
+            if rename_submitted:
+                if not renamed_category.strip():
+                    st.error("Nama kategori wajib diisi.")
+                else:
+                    try:
+                        rename_category(category_to_edit, renamed_category)
+                    except sqlite3.IntegrityError:
+                        st.error("Nama kategori tersebut sudah digunakan.")
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Kategori berhasil diperbarui.")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("Hapus kategori")
+            category_to_remove = st.selectbox(
+                "Pilih kategori untuk dihapus",
+                category_options,
+                key="remove_category_selection",
+            )
+            products_in_category = category_usage[category_to_remove]
+            replacement_options = [
+                category_name
+                for category_name in category_options
+                if category_name != category_to_remove
+            ]
+            replacement_category = None
+            if products_in_category:
+                if replacement_options:
+                    replacement_category = st.selectbox(
+                        "Pindahkan produk ke kategori",
+                        replacement_options,
+                        key=f"replacement_category_{category_to_remove}",
+                    )
+                    st.caption(
+                        f"{products_in_category} produk akan dipindahkan sebelum kategori dihapus."
+                    )
+                else:
+                    st.warning(
+                        "Tambahkan kategori lain terlebih dahulu untuk memindahkan produk."
+                    )
+            with st.form("remove_category_form"):
+                confirm_category_delete = st.checkbox(
+                    f"Saya yakin ingin menghapus kategori {category_to_remove}."
+                )
+                remove_submitted = st.form_submit_button(
+                    "Hapus kategori",
+                    type="secondary",
+                    disabled=bool(products_in_category and not replacement_options),
+                )
+            if remove_submitted:
+                if not confirm_category_delete:
+                    st.warning("Centang konfirmasi sebelum menghapus kategori.")
+                else:
+                    try:
+                        remove_category(category_to_remove, replacement_category)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success("Kategori berhasil dihapus.")
+                        st.rerun()
         else:
             st.info("Belum ada kategori.")
 

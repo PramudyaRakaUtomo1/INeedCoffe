@@ -5,7 +5,7 @@ Aplikasi manajemen inventaris sederhana untuk coffee shop, dibuat dengan Streaml
 ## Fitur
 
 - Dashboard ringkasan stok, nilai persediaan, dan peringatan stok minimum.
-- Tambah, cari, filter, edit, dan hapus produk, serta kelola kategori produk.
+- Tambah, cari, filter, edit, dan hapus produk; kategori dapat ditambah, diedit, dan dihapus.
 - Catat transaksi stok masuk dan keluar dengan validasi stok tersedia.
 - Riwayat transaksi dengan filter, pencarian, dan ekspor Excel `.xls`.
 - Contoh produk dimuat otomatis saat database pertama kali dibuat.
