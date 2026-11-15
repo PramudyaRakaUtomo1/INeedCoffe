@@ -12,7 +12,7 @@ import xlwt
 
 
 st.set_page_config(
-    page_title="Kopi & Stok",
+    page_title="I Need Coffee",
     page_icon="☕",
     layout="wide",
     initial_sidebar_state="expanded",
