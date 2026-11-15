@@ -298,7 +298,9 @@ def render_dashboard(products, transactions):
 def render_inventory(products):
     st.title("📦 Produk")
     st.caption("Kelola katalog, stok, dan batas minimum persediaan.")
-    list_tab, add_tab, edit_tab = st.tabs(["Daftar produk", "Tambah produk", "Edit / hapus"])
+    list_tab, add_tab, edit_tab, delete_tab = st.tabs(
+        ["Daftar produk", "Tambah produk", "Edit produk", "Hapus produk"]
+    )
 
     with list_tab:
         search_col, category_col, status_col = st.columns([2, 1, 1])
@@ -375,13 +377,59 @@ def render_inventory(products):
                     st.success("Perubahan produk berhasil disimpan.")
                     st.rerun()
 
-            with st.expander("Hapus produk"):
-                st.warning("Riwayat transaksi akan tetap tersimpan, tetapi tidak lagi terhubung ke produk.")
-                confirm_delete = st.checkbox(f"Saya yakin ingin menghapus {selected['name']}", key=f"confirm_{selected['id']}")
-                if st.button("Hapus produk ini", disabled=not confirm_delete, type="secondary"):
+    with delete_tab:
+        if not products:
+            st.info("Belum ada produk untuk dihapus.")
+        else:
+            st.caption("Pilih produk pada kolom Hapus, lalu konfirmasi tindakan di bawah tabel.")
+            delete_table = pd.DataFrame(
+                [
+                    {
+                        "ID": product["id"],
+                        "Hapus": False,
+                        "Nama produk": product["name"],
+                        "Kategori": product["category"],
+                        "Stok": f'{product["stock_qty"]} {product["unit"]}',
+                        "Batas minimum": f'{product["min_stock"]} {product["unit"]}',
+                    }
+                    for product in products
+                ]
+            )
+            with st.form("delete_products_form"):
+                selected_products = st.data_editor(
+                    delete_table,
+                    column_config={
+                        "ID": None,
+                        "Hapus": st.column_config.CheckboxColumn(
+                            "Hapus",
+                            help="Centang produk yang ingin dihapus.",
+                            default=False,
+                        ),
+                    },
+                    disabled=["ID", "Nama produk", "Kategori", "Stok", "Batas minimum"],
+                    hide_index=True,
+                    num_rows="fixed",
+                    width="stretch",
+                )
+                confirm_delete = st.checkbox(
+                    "Saya yakin ingin menghapus produk yang dipilih."
+                )
+                submitted = st.form_submit_button("Hapus produk terpilih", type="primary")
+            if submitted:
+                product_ids = selected_products.loc[
+                    selected_products["Hapus"], "ID"
+                ].astype(int).tolist()
+                if not product_ids:
+                    st.warning("Pilih setidaknya satu produk pada tabel.")
+                elif not confirm_delete:
+                    st.warning("Centang konfirmasi sebelum menghapus produk.")
+                else:
                     with database() as connection:
-                        connection.execute("DELETE FROM products WHERE id = ?", (selected["id"],))
-                    st.success("Produk berhasil dihapus.")
+                        connection.executemany(
+                            "DELETE FROM products WHERE id = ?",
+                            [(product_id,) for product_id in product_ids],
+                        )
+                    st.success(f"{len(product_ids)} produk berhasil dihapus.")
                     st.rerun()
 
 
